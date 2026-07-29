@@ -1,0 +1,13 @@
+# Python venv (created locally, not committed)
+thinking_proxy_venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# NSSM (downloaded by setup script, not committed)
+nssm/
