@@ -38,7 +38,7 @@ which is correct).
 ### 1. Clone and set up the proxy
 
 ```bash
-git clone https://github.com/<your-org>/deepseek-thinking-proxy.git
+git clone https://github.com/JazzyGeorge/deepseek-proxy
 cd deepseek-thinking-proxy
 ```
 
