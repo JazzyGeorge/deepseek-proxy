@@ -49,7 +49,7 @@ cd deepseek-thinking-proxy
 ```bash
 # Create venv
 python3 -m venv thinking_proxy_venv
-thinking_proxy_venv/bin/pip install aiohttp
+thinking_proxy_venv/bin/pip install -r requirements.txt
 
 # Create env file with your DeepSeek API key
 mkdir -p ~/Secrets
@@ -109,7 +109,7 @@ New-Item -ItemType Directory -Force -Path $PROXY_DIR, "$PROXY_DIR\logs" | Out-Nu
 # Create venv using py (the python.org launcher — avoids Store Python)
 py -m venv "$PROXY_DIR\venv"
 & "$PROXY_DIR\venv\Scripts\python.exe" -m pip install --upgrade pip
-& "$PROXY_DIR\venv\Scripts\pip.exe" install aiohttp
+& "$PROXY_DIR\venv\Scripts\pip.exe" install -r requirements.txt
 
 # Copy proxy script and launcher from the repo to the service directory
 Copy-Item thinking_proxy.py "$PROXY_DIR\"
@@ -203,6 +203,7 @@ curl -s http://localhost:16889/v1/messages \
 | File | Purpose |
 |------|---------|
 | `thinking_proxy.py` | The proxy — cross-platform Python + aiohttp |
+| `requirements.txt` | Python dependencies (`aiohttp`) |
 | `thinking_proxy_launcher.sh` | macOS launcher — sources env file, starts proxy |
 | `launcher.bat` | Windows launcher — reads env file, starts proxy |
 | `LICENSE` | MIT |
