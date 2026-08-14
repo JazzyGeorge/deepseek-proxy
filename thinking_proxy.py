@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
-Local reverse proxy that injects `thinking: {type: "disabled"}` into
-non-streaming requests to DeepSeek's Anthropic-compatible endpoint.
+Local reverse proxy that fixes DeepSeek V4 ↔ Claude Code protocol mismatches.
 
-Fixes the ~30s TTFB timeout when Claude Code's security classifier sends
-non-streaming requests without a `thinking` field — DeepSeek V4 defaults to
-thinking ON, causing the classifier to time out.
+Fixes:
+  1. Non-streaming timeout     — inject thinking:disabled → TTFB 30s→2s
+  2. SSE thinking/signature    — strip DeepSeek-only events that break Claude Code
+  3. thinking.type=adaptive    — remap to "enabled" (DeepSeek rejects "adaptive")
+  4. Missing thinking blocks   — inject empty thinking before tool_use in responses
+  5. reasoning_effort conflict — strip when thinking=disabled (DeepSeek 400s)
 
-Usage:
-    ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic" \
-    python3 thinking_proxy.py
-
-The proxy reads the upstream URL from the ANTHROPIC_BASE_URL env var
-(typically set by a launcher script that sources the user's secrets file).
-Auth is forwarded from incoming requests — the proxy never stores or logs
-API keys.
-
-Endpoints:
-    POST /v1/messages*  — inject thinking:disabled if non-streaming
-    GET  /v1/models     — Anthropic-native model list
-    GET  /health        — {"status": "ok"}
-    ANY  /*             — transparent passthrough
+Architecture:  Claude Code → http://localhost:16889 → https://api.deepseek.com/anthropic
 """
 
 import asyncio
@@ -30,10 +19,6 @@ import os
 import sys
 from pathlib import Path
 
-# Prevent _pyrepl from loading in non-interactive contexts (launchd service).
-# Python 3.13+'s new REPL calls terminal ioctls on missing console → OSError.
-# PYTHON_BASIC_REPL tells site.py to skip _pyrepl entirely.
-# Set BEFORE any other imports that might trigger exception formatting.
 if not sys.stdin.isatty():
     os.environ.setdefault("PYTHON_BASIC_REPL", "1")
 
@@ -43,45 +28,29 @@ from aiohttp.client_exceptions import (
     ClientPayloadError,
 )
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("THINKING_PROXY_PORT", "16889"))
 UPSTREAM_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
-
-# Ensure we don't double up paths — strip trailing /v1 if present
 if UPSTREAM_URL.endswith("/v1"):
     UPSTREAM_URL = UPSTREAM_URL[:-3]
 
-# Retry settings for transient upstream errors
-RETRY_DELAY = 1.5  # seconds between retries
-MAX_RETRIES = 1    # one retry → two total attempts
+RETRY_DELAY = 1.5
+MAX_RETRIES = 1
 TRANSIENT_ERRORS = (
-    ClientConnectorError,    # cannot connect to upstream
-    ClientPayloadError,      # truncated/incomplete response body
-    ConnectionResetError,    # upstream reset the connection
-    TimeoutError,            # request timed out
+    ClientConnectorError,
+    ClientPayloadError,
+    ConnectionResetError,
+    TimeoutError,
 )
 
-# Hop-by-hop headers that must be stripped before forwarding
 HOP_HEADERS = {
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "upgrade",
-    "accept-encoding",  # Strip client Accept-Encoding
-    "content-encoding",  # Strip response Content-Encoding
+    "host", "content-length", "transfer-encoding", "connection",
+    "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "upgrade", "accept-encoding", "content-encoding",
 }
 
-# Logging — stdout for launchd, stderr for errors. No API keys ever logged.
+DEEPSEEK_ONLY_SSE_EVENTS = {"thinking", "signature_delta"}
+
 LOG_DIR = None
 if sys.platform == "darwin":
     LOG_DIR = Path.home() / ".local" / "state" / "thinking-proxy"
@@ -102,21 +71,11 @@ logging.basicConfig(
 log = logging.getLogger("thinking-proxy")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def clean_headers(headers: dict) -> dict:
-    """Strip hop-by-hop headers and return clean forwarding headers."""
-    return {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in HOP_HEADERS
-    }
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
 
 
 def mask_key(value: str) -> str:
-    """Return a masked version of an auth header for logging."""
     if not value:
         return "<empty>"
     if len(value) < 12:
@@ -125,48 +84,141 @@ def mask_key(value: str) -> str:
 
 
 def extract_auth_headers(headers: dict) -> dict:
-    """Extract only auth-relevant headers from incoming request."""
     auth = {}
     for k, v in headers.items():
-        kl = k.lower()
-        if kl in ("x-api-key", "authorization"):
+        if k.lower() in ("x-api-key", "authorization"):
             auth[k] = v
     return auth
 
 
-def inject_thinking_disabled(body_bytes: bytes) -> bytes:
-    """Inject ``{"thinking": {"type": "disabled"}}`` into a JSON request body
-    if it is non-streaming and has no existing ``thinking`` field.
+# ---------------------------------------------------------------------------
+# Fix 1: Request normalization
+# ---------------------------------------------------------------------------
 
-    Returns the original bytes if no modification is needed.
-    """
+def normalize_request_body(body_bytes: bytes) -> bytes:
     if not body_bytes:
         return body_bytes
-
     try:
         data = json.loads(body_bytes.decode("utf-8"))
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-        return body_bytes  # not valid JSON, pass through unchanged
-
+        return body_bytes
     if not isinstance(data, dict):
         return body_bytes
 
-    # Streaming requests should keep thinking enabled for normal chat
-    if data.get("stream") is True:
-        return body_bytes
+    modified = False
 
-    # Already has a thinking field — don't override
     if "thinking" in data:
-        return body_bytes
+        thinking = data["thinking"]
+        if isinstance(thinking, dict):
+            ttype = thinking.get("type")
+            # Fix 1a: adaptive -> enabled
+            if ttype == "adaptive":
+                thinking["type"] = "enabled"
+                modified = True
+                log.info("remapped thinking.type adaptive -> enabled")
+            # Fix 1b: strip reasoning_effort when thinking=disabled
+            if ttype == "disabled" and "reasoning_effort" in data:
+                del data["reasoning_effort"]
+                modified = True
+                log.info("stripped reasoning_effort (incompatible with thinking=disabled)")
+    elif data.get("stream") is not True:
+        # Fix 1c: inject thinking:disabled for non-streaming
+        data["thinking"] = {"type": "disabled"}
+        modified = True
+        log.info("injected thinking:disabled into non-streaming request")
 
-    # Non-streaming, no thinking field → inject disabled
-    data["thinking"] = {"type": "disabled"}
-    log.info("injected thinking:disabled into non-streaming request")
-    return json.dumps(data).encode("utf-8")
+    if modified:
+        return json.dumps(data).encode("utf-8")
+    return body_bytes
 
 
 # ---------------------------------------------------------------------------
-# Endpoint: GET /v1/models
+# Fix 2: SSE event filter
+# ---------------------------------------------------------------------------
+
+class SseFilter:
+    def __init__(self):
+        self._buffer = b""
+        self._skip_until_blank = False
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._buffer += chunk
+        output = bytearray()
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            line_str = line.decode("utf-8", errors="replace")
+            if line_str.strip() == "":
+                self._skip_until_blank = False
+                output.extend(b"\n")
+                continue
+            if line_str.startswith("event: "):
+                event_type = line_str[7:].strip()
+                if event_type in DEEPSEEK_ONLY_SSE_EVENTS:
+                    self._skip_until_blank = True
+                    continue
+            if not self._skip_until_blank:
+                output.extend(line)  # line is already bytes
+                output.extend(b"\n")
+        return bytes(output)
+
+    def flush(self) -> bytes:
+        if self._buffer and not self._skip_until_blank:
+            remaining = self._buffer
+            self._buffer = b""
+            return remaining
+        self._buffer = b""
+        return b""
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Missing thinking block injection
+# ---------------------------------------------------------------------------
+
+def inject_missing_thinking_blocks(resp_body: bytes) -> bytes:
+    if not resp_body:
+        return resp_body
+    try:
+        data = json.loads(resp_body.decode("utf-8"))
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return resp_body
+    if not isinstance(data, dict):
+        return resp_body
+
+    modified = False
+    if "content" in data and isinstance(data["content"], list):
+        modified = _fix_content_blocks(data["content"]) or modified
+    if "message" in data and isinstance(data["message"], dict):
+        msg = data["message"]
+        if "content" in msg and isinstance(msg["content"], list):
+            modified = _fix_content_blocks(msg["content"]) or modified
+
+    if modified:
+        log.info("injected missing thinking block(s) into response")
+        return json.dumps(data).encode("utf-8")
+    return resp_body
+
+
+def _fix_content_blocks(blocks: list) -> bool:
+    modified = False
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            prev_is_thinking = (
+                i > 0
+                and isinstance(blocks[i - 1], dict)
+                and blocks[i - 1].get("type") == "thinking"
+            )
+            if not prev_is_thinking:
+                blocks.insert(i, {"type": "thinking", "thinking": ""})
+                modified = True
+                i += 1
+        i += 1
+    return modified
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
 # ---------------------------------------------------------------------------
 
 MODELS_RESPONSE = {
@@ -185,17 +237,10 @@ MODELS_RESPONSE = {
 
 
 async def handle_models(request: web.Request) -> web.Response:
-    """Return Anthropic-native model list for Claude Code startup validation."""
     return web.json_response(MODELS_RESPONSE)
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: GET /health
-# ---------------------------------------------------------------------------
-
-
 async def handle_health(request: web.Request) -> web.Response:
-    """Health check — confirms proxy is alive."""
     return web.json_response({"status": "ok", "upstream": UPSTREAM_URL})
 
 
@@ -203,19 +248,14 @@ async def handle_health(request: web.Request) -> web.Response:
 # Main proxy handler
 # ---------------------------------------------------------------------------
 
-
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
-    """Forward the request to upstream, injecting thinking:disabled if needed."""
     path = request.path
     method = request.method
-
-    # Read and optionally modify request body
     body = await request.read()
 
     if method == "POST" and path.startswith("/v1/messages") and body:
-        body = inject_thinking_disabled(body)
+        body = normalize_request_body(body)
 
-    # Build forwarding headers — include auth from the incoming request
     fwd_headers = clean_headers(dict(request.headers))
     fwd_headers["host"] = UPSTREAM_URL.split("://", 1)[1].split("/", 1)[0]
 
@@ -223,25 +263,22 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     if request.query_string:
         upstream_url = f"{upstream_url}?{request.query_string}"
 
-    # Log the request (mask auth)
     auth_headers = extract_auth_headers(dict(request.headers))
     auth_info = ",".join(f"{k}:{mask_key(v)}" for k, v in auth_headers.items()) or "none"
-    log.info("→ %s %s [auth: %s] [body: %d bytes]", method, path, auth_info, len(body))
+    log.info("-> %s %s [auth: %s] [body: %d bytes]", method, path, auth_info, len(body))
 
     last_exc = None
+    stream_started = False
     for attempt in range(MAX_RETRIES + 1):
         try:
             async with ClientSession() as session:
                 async with session.request(
-                    method=method,
-                    url=upstream_url,
-                    headers=fwd_headers,
-                    data=body,
+                    method=method, url=upstream_url,
+                    headers=fwd_headers, data=body,
                 ) as upstream:
                     content_type = upstream.headers.get("Content-Type", "")
 
                     if "text/event-stream" in content_type:
-                        # --- Streaming SSE path ---
                         resp = web.StreamResponse(
                             status=upstream.status,
                             headers={k: v for k, v in upstream.headers.items()
@@ -250,20 +287,34 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                         resp.headers["Cache-Control"] = "no-cache"
                         resp.headers["X-Accel-Buffering"] = "no"
                         await resp.prepare(request)
+                        stream_started = True
 
+                        sse_filter = SseFilter()
                         byte_count = 0
                         async for chunk in upstream.content.iter_any():
                             if chunk:
-                                await resp.write(chunk)
-                                byte_count += len(chunk)
+                                filtered = sse_filter.feed(chunk)
+                                if filtered:
+                                    await resp.write(filtered)
+                                    byte_count += len(filtered)
+
+                        remaining = sse_filter.flush()
+                        if remaining:
+                            await resp.write(remaining)
+                            byte_count += len(remaining)
 
                         await resp.write_eof()
-                        log.info("← %d (SSE streamed, %d bytes)", upstream.status, byte_count)
+                        log.info("<- %d (SSE filtered, %d bytes)", upstream.status, byte_count)
                         return resp
                     else:
-                        # --- Non-streaming path ---
                         resp_body = await upstream.read()
-                        log.info("← %d (%d bytes)", upstream.status, len(resp_body))
+
+                        if upstream.status == 200 and b"tool_use" in resp_body:
+                            fixed_body = inject_missing_thinking_blocks(resp_body)
+                            if fixed_body != resp_body:
+                                resp_body = fixed_body
+
+                        log.info("<- %d (%d bytes)", upstream.status, len(resp_body))
                         return web.Response(
                             status=upstream.status,
                             headers={k: v for k, v in upstream.headers.items()
@@ -272,22 +323,30 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                         )
         except TRANSIENT_ERRORS as exc:
             last_exc = exc
+            if stream_started:
+                # The client stream has already begun — a clean 502 is impossible
+                # and retrying would only fetch data for a dead connection.
+                break
             if attempt < MAX_RETRIES:
                 log.warning(
                     "upstream transient error (attempt %d/%d): %s: %s — retrying in %.1fs",
-                    attempt + 1, MAX_RETRIES + 1,
-                    type(exc).__name__, exc,
-                    RETRY_DELAY,
+                    attempt + 1, MAX_RETRIES + 1, type(exc).__name__, exc, RETRY_DELAY,
                 )
                 await asyncio.sleep(RETRY_DELAY)
         except Exception as exc:
             last_exc = exc
-            break  # non-transient — don't retry
+            log.exception("non-transient upstream error on %s %s", method, path)
+            break
 
-    # All retries exhausted or non-transient error
-    log.exception(
-        "upstream request failed after %d attempt(s): %s %s",
-        MAX_RETRIES + 1, method, path,
+    if stream_started:
+        # Can't send a 502 once the response is streaming — abort so the client
+        # sees a clean connection failure instead of a 502 embedded in the
+        # chunked body.
+        raise last_exc
+
+    log.error(
+        "upstream request failed after %d attempt(s): %s %s — %s: %s",
+        MAX_RETRIES + 1, method, path, type(last_exc).__name__, last_exc,
     )
     return web.json_response(
         {"error": "upstream request failed", "detail": str(last_exc)},
@@ -295,31 +354,16 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# App factory
-# ---------------------------------------------------------------------------
-
-
 def create_app() -> web.Application:
     app = web.Application()
-
-    # Specific endpoints
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
-
-    # Catch-all proxy — must be last
     app.router.add_route("*", "/{tail:.*}", proxy_handler)
-
     return app
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
-    log.info("starting thinking-proxy on %s:%s → %s", LISTEN_HOST, LISTEN_PORT, UPSTREAM_URL)
+    log.info("starting thinking-proxy on %s:%s -> %s", LISTEN_HOST, LISTEN_PORT, UPSTREAM_URL)
     app = create_app()
     web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, print=log.info)
 
