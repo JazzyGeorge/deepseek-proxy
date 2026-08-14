@@ -1,45 +1,60 @@
 # DeepSeek Thinking Proxy
 
-Fixes Claude Code's security-classifier timeout when using DeepSeek V4 via the
-Anthropic-compatible API. A local loopback proxy that disables reasoning on
-non-streaming requests and retries on transient connection errors.
+Local reverse proxy that fixes protocol mismatches between DeepSeek V4 and
+Claude Code on DeepSeek's Anthropic-compatible endpoint.
 
 **Architecture:** `Claude Code → http://localhost:16889 → https://api.deepseek.com/anthropic`
 
-## The Problem
+## What It Fixes
 
-Claude Code's built-in security classifier sends **non-streaming** requests to
-DeepSeek's Anthropic-compatible endpoint. DeepSeek V4 is a reasoning model — when
-no `thinking` field is present in a non-streaming request, it defaults to thinking
-ON. The time-to-first-byte equals the full reasoning duration.
+| # | Problem | Fix |
+|---|---------|-----|
+| 1 | **Classifier timeout** — non-streaming requests without a `thinking` field make DeepSeek V4 reason first, so TTFB ≈ full reasoning time (~30s) and Claude Code's security classifier times out | Inject `thinking: {type: "disabled"}` into non-streaming requests → TTFB drops to 2–3s |
+| 2 | **DeepSeek-only SSE events** — thinking events in streams confused Claude Code ("Tool result missing due to internal error") | `SseFilter` strips `event: thinking` / `event: signature_delta` lines from streams. Today DeepSeek emits thinking via standard Anthropic event names, so the filter is a pass-through safety net — but it must not crash, see History |
+| 3 | **`thinking: {type: "adaptive"}`** — Claude Code sends this by default; DeepSeek rejected it with 400 | Remap `adaptive` → `enabled` (DeepSeek currently accepts `adaptive` too — the remap is harmless insurance) |
+| 4 | **`reasoning_effort` + `thinking: disabled`** — DeepSeek rejects the combination | Strip `reasoning_effort` when thinking is disabled |
+| 5 | **Missing thinking blocks** — DeepSeek's non-streaming tool-use responses lack the `thinking` block Claude Code requires before every `tool_use` | Inject an empty `thinking` block before each `tool_use` in responses |
 
-At realistic payload sizes (~2.9K input tokens), response time hits **28–32 seconds**,
-exceeding Claude Code's ~30s classifier timeout. The command is blocked and retried
-endlessly.
+Transport hardening (added 2026-08-13):
 
-Additionally, DeepSeek sporadically drops connections on large payloads
-(`ConnectionResetError`, `TransferEncodingError`), returning malformed responses.
+- **Stream-abort guard** — once the client stream has started, any error aborts
+  the connection cleanly instead of embedding a 502 inside the chunked body
+- **Real exception logging** — a previous `log.exception()` call sat outside any
+  `except` block and printed `NoneType: None`, hiding the crash described below
+- **Transient retry** — one retry after 1.5s on connection resets, truncated
+  payloads, and timeouts (skipped once a stream has started — retrying only
+  fetches data for a dead connection)
 
-**Upstream issue:** [deepseek-ai/DeepSeek-V3#1464](https://github.com/deepseek-ai/DeepSeek-V3/issues/1464)
+## History
 
-## The Fix
+- **v1** — the original proxy fixed only #1 (non-streaming timeout) and retried
+  transient errors. It worked fine on machines where the client and API never
+  hit the other mismatches.
+- **2026-08-11** — fixes #2–#5 were added for a Windows machine where Claude
+  Code was hitting all of them.
+- **2026-08-13** — fix #2 was found to contain a bug: `SseFilter.feed()` called
+  `.encode()` on a `bytes` object, crashing on the first line of **every**
+  streaming request. The proxy would send 200 headers, die mid-stream, and
+  corrupt the body with a literal `HTTP/1.1 502 Bad Gateway`. Fixed, plus the
+  hardening above; all five fixes verified live against DeepSeek.
 
-This proxy sits between Claude Code and DeepSeek. For every non-streaming request:
+Also observed 2026-08-13 (DeepSeek API is a moving target):
 
-1. **Injects `thinking: {type: "disabled"}`** — TTFB drops from 30s → 2-3s
-2. **Retries once on transient errors** — catches connection resets, truncated
-   responses, and connection timeouts with a 1.5s delay
-
-Streaming requests pass through unchanged (thinking stays enabled for normal chat,
-which is correct).
+- DeepSeek now **accepts** `thinking.type=adaptive` directly (raw 200).
+- DeepSeek no longer sends custom `event: thinking` / `event: signature_delta`
+  event names — its thinking content uses standard Anthropic event names with
+  Anthropic-compatible shapes (`content_block_start` →
+  `{"type": "thinking", "thinking": "", "signature": ""}`,
+  `delta.type=thinking_delta`/`signature_delta`).
+- With `thinking: {"type": "disabled"}` DeepSeek sends text-only streams.
 
 ## Quick Start
 
-### 1. Clone and set up the proxy
+### 1. Clone
 
 ```bash
 git clone https://github.com/JazzyGeorge/deepseek-proxy
-cd deepseek-thinking-proxy
+cd deepseek-proxy
 ```
 
 ### 2. Install
@@ -76,7 +91,7 @@ cat > ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist << 'EOF'
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/<username>/deepseek-thinking-proxy/thinking_proxy_launcher.sh</string>
+        <string>/Users/<username>/deepseek-proxy/thinking_proxy_launcher.sh</string>
     </array>
     <key>KeepAlive</key>
     <true/>
@@ -85,9 +100,9 @@ cat > ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist << 'EOF'
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/<username>/deepseek-thinking-proxy/logs/stdout.log</string>
+    <string>/Users/<username>/deepseek-proxy/logs/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/<username>/deepseek-thinking-proxy/logs/stderr.log</string>
+    <string>/Users/<username>/deepseek-proxy/logs/stderr.log</string>
 </dict>
 </plist>
 EOF
@@ -99,7 +114,11 @@ launchctl load -w ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist
 #### Windows
 
 **Prerequisites:**
-- Python 3.10+ from [python.org](https://www.python.org/downloads/) (NOT the Microsoft Store version — Store Python runs from a sandboxed `WindowsApps` directory that NSSM cannot launch)
+
+- Python 3.10+ — `py -m venv` (the python.org launcher) is the safest route.
+  Note: the newer Microsoft Store Python (`pythoncore-*`) installs under
+  `%LOCALAPPDATA%\Python` and works with NSSM; older Store Python under
+  `WindowsApps` does not.
 - Administrator PowerShell
 
 ```powershell
@@ -146,6 +165,15 @@ Start-Sleep -Seconds 3
 Invoke-RestMethod -Uri "http://localhost:16889/health" -TimeoutSec 5
 ```
 
+> If the service crashes on startup with `OSError 10048` (address in use), an
+> orphaned proxy process is still holding port 16889. Kill it before starting
+> the service again:
+>
+> ```powershell
+> $p = Get-NetTCPConnection -LocalPort 16889 -ErrorAction SilentlyContinue
+> if ($p) { Stop-Process -Id $p.OwningProcess -Force }
+> ```
+
 ### 3. Configure Claude Code
 
 Add to `~/.claude/settings.json` (macOS) or set as permanent environment
@@ -167,13 +195,12 @@ For Windows, persist these via PowerShell:
 [Environment]::SetEnvironmentVariable("CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS", "1", "User")
 ```
 
-> **Important:** `ANTHROPIC_AUTH_TOKEN` stays in the secrets file — do NOT copy it
-> into `settings.json` or set it as a system-wide env var.
+> **Important:** `ANTHROPIC_AUTH_TOKEN` stays in the secrets file — do NOT copy
+> it into `settings.json` or set it as a system-wide env var.
 
 ### 4. Restart Claude Code
 
-Quit and restart. Run any Bash command — the security classifier should work
-without timeout.
+Quit and restart.
 
 ## Verifying It Works
 
@@ -181,22 +208,93 @@ without timeout.
 # Health check
 curl http://localhost:16889/health
 # → {"status": "ok", "upstream": "https://api.deepseek.com/anthropic"}
-
-# Non-streaming classifier test (should return in ~2-4s, not 30s)
-curl -s http://localhost:16889/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: $ANTHROPIC_AUTH_TOKEN" \
-  -d '{
-    "model": "deepseek-v4-pro",
-    "max_tokens": 256,
-    "stream": false,
-    "messages": [{
-      "role": "user",
-      "content": "Classify this bash command as SAFE or UNSAFE with a brief reason. Command: rm -rf ~/Downloads/temp-folder/*"
-    }]
-  }'
-# Should return SAFE/UNSAFE verdict in ~2-4 seconds
 ```
+
+Windows PowerShell (reads the key from the secrets file):
+
+```powershell
+$env:ANTHROPIC_AUTH_TOKEN = (Get-Content "$env:USERPROFILE\Secrets\Anthropic_DeepSeek_env" | Select-String "ANTHROPIC_AUTH_TOKEN" | ForEach-Object { $_ -replace '.*ANTHROPIC_AUTH_TOKEN=([^ ]+).*', '$1' })
+
+# Fix #1 — non-streaming classifier test: should return in ~2-4s, not 30s
+$body = @{ model = "claude-opus-4-6"; max_tokens = 256; stream = $false;
+           messages = @(@{ role = "user"; content = "Classify this bash command as SAFE or UNSAFE with a brief reason. Command: rm -rf ~/Downloads/temp-folder/*" }) } | ConvertTo-Json -Depth 4
+Measure-Command { $r = Invoke-RestMethod -Uri "http://localhost:16889/v1/messages" -Method Post -Body $body -ContentType "application/json" -Headers @{"x-api-key"=$env:ANTHROPIC_AUTH_TOKEN} -TimeoutSec 60 } | Select-Object -ExpandProperty TotalSeconds
+
+# Fix #3 — adaptive thinking: should return 200 (not 400)
+$body = @{ model = "claude-opus-4-6"; max_tokens = 128; stream = $false; thinking = @{ type = "adaptive" };
+           messages = @(@{ role = "user"; content = "Say hello in 3 words" }) } | ConvertTo-Json -Depth 5
+$r = Invoke-RestMethod -Uri "http://localhost:16889/v1/messages" -Method Post -Body $body -ContentType "application/json" -Headers @{"x-api-key"=$env:ANTHROPIC_AUTH_TOKEN} -TimeoutSec 60
+# Should be 200 with blocks: thinking, text
+
+# Fix #5 — tool_use: response blocks should be thinking → tool_use
+$body = @{ model = "claude-opus-4-6"; max_tokens = 256; stream = $false;
+           tools = @(@{ name = "get_weather"; description = "Get the current weather"; input_schema = @{ type = "object"; properties = @{ city = @{ type = "string" } }; required = @("city") } });
+           messages = @(@{ role = "user"; content = "What is the weather in Paris? Use the get_weather tool." }) } | ConvertTo-Json -Depth 6
+$r = Invoke-RestMethod -Uri "http://localhost:16889/v1/messages" -Method Post -Body $body -ContentType "application/json" -Headers @{"x-api-key"=$env:ANTHROPIC_AUTH_TOKEN} -TimeoutSec 60
+$r.content | ForEach-Object { $_.type }
+# Should print: thinking, tool_use
+
+# Fix #2 — streaming: must complete cleanly (no 502, no broken chunked body)
+$body = @{ model = "claude-opus-4-6"; max_tokens = 256; stream = $true;
+           messages = @(@{ role = "user"; content = "Count from 1 to 5" }) } | ConvertTo-Json -Depth 4
+$body | curl.exe -sN -X POST http://localhost:16889/v1/messages -H "Content-Type: application/json" -H "x-api-key: $env:ANTHROPIC_AUTH_TOKEN" --data-binary "@-"
+# Should stream message_start → content blocks → message_stop without errors
+```
+
+The streaming test logs a `<- 200 (SSE filtered, N bytes)` line — the proxy's
+proof that a stream passed through the filter cleanly.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | Upstream endpoint (`/v1` suffix is stripped) |
+| `THINKING_PROXY_PORT` | `16889` | Local listen port (`127.0.0.1`) |
+
+| Endpoint | Behavior |
+|----------|----------|
+| `GET /health` | `{"status": "ok", "upstream": ...}` |
+| `GET /v1/models` | Anthropic-native model list |
+| `POST /v1/messages*` | Normalized + filtered + forwarded |
+| `ANY /*` | Transparent passthrough |
+
+## How It Works
+
+### Request normalization (`normalize_request_body`)
+
+- Non-streaming request without a `thinking` field → injects
+  `{"thinking": {"type": "disabled"}}` (fix #1)
+- `thinking.type == "adaptive"` → remaps to `"enabled"` (fix #3)
+- `thinking.type == "disabled"` + `reasoning_effort` → strips
+  `reasoning_effort` (fix #4)
+
+### SSE filtering (`SseFilter`)
+
+Parses the upstream byte stream line-by-line and drops DeepSeek-only
+`event: thinking` / `event: signature_delta` events (fix #2). All other
+events pass through unchanged. Since DeepSeek currently emits thinking via
+standard Anthropic event names, this filter is normally a no-op safety net.
+
+### Response fixup (`inject_missing_thinking_blocks`)
+
+For non-streaming 200 responses containing `tool_use`, inserts an empty
+`{"type": "thinking", "thinking": ""}` block before every `tool_use` that
+isn't already preceded by one (fix #5).
+
+### Stream-abort guard
+
+If the upstream request fails after the client stream has already started,
+the proxy aborts the connection instead of attempting to send a 502 inside
+the chunked body. Transient-error retries are skipped in that state.
+
+### What the proxy does NOT touch
+
+- **Auth headers** — forwarded verbatim, never stored; logged only masked
+- **Requests with a valid `thinking` config** — passed through (only the
+  `adaptive` remap and the `reasoning_effort` strip apply)
+- **Streamed content** — filtered line-by-line for the two event names, but
+  never rewritten
+- **API keys** — the proxy never reads or stores keys itself
 
 ## Files
 
@@ -208,35 +306,6 @@ curl -s http://localhost:16889/v1/messages \
 | `launcher.bat` | Windows launcher — reads env file, starts proxy |
 | `LICENSE` | MIT |
 
-## How It Works
-
-### Non-streaming timeout fix
-
-Claude Code's security classifier sends `POST /v1/messages` with `stream: false`
-and no `thinking` field. DeepSeek V4 defaults to thinking ON → TTFB = full
-reasoning time → 30s timeout. The proxy detects these requests and injects
-`{"thinking": {"type": "disabled"}}` into the JSON body.
-
-### Transient error retry
-
-DeepSeek occasionally drops connections mid-response on large payloads (150KB+).
-The proxy catches `ConnectionResetError`, `ClientPayloadError`, `ClientConnectorError`,
-and `TimeoutError`, then retries once after a 1.5s delay.
-
-### Python 3.13+ `_pyrepl` guard
-
-Python 3.13+ ships a new REPL (`_pyrepl`) that queries console dimensions on
-startup. When running as a Windows Service (or under launchd), there is no
-console → `GetConsoleScreenBufferInfo()` fails → recursive traceback cascade.
-The proxy sets `PYTHON_BASIC_REPL=1` before importing anything that touches the
-exception display machinery.
-
-### What the proxy does NOT touch
-
-- **Streaming requests** (`stream: true`) pass through unchanged
-- **Requests that already have a `thinking` field** — never overridden
-- **Auth headers** — forwarded verbatim, never logged in full (only masked)
-
 ## Troubleshooting
 
 ### macOS
@@ -246,16 +315,17 @@ exception display machinery.
 | Proxy not running | `launchctl list \| grep thinking` |
 | Connection refused | `curl http://localhost:16889/health` |
 | Auth errors | `ls ~/Secrets/Anthropic_DeepSeek.env` |
-| Logs | `tail ~/deepseek-thinking-proxy/logs/proxy.log` |
+| Logs | `tail ~/.local/state/thinking-proxy/proxy.log` |
 
 ### Windows
 
 | Issue | Check |
 |-------|-------|
 | Service not running | `& "$env:APPDATA\thinking-proxy\nssm\nssm.exe" status DeepSeekThinkingProxy` |
+| Streaming requests fail / 502s | Logs should show `<- 200 (SSE filtered, N bytes)` for healthy streams and no `502` after the fix; check `%APPDATA%\thinking-proxy\logs\stdout.log` (NSSM stdout) — the Python-side log is `%LOCALAPPDATA%\thinking-proxy\logs\proxy.log` |
 | `stderr.log` growing fast | Verify `PYTHON_BASIC_REPL=1` is set on the service |
+| `OSError 10048` on startup | Another process holds port 16889 — kill it (see Quick Start note) |
 | Store Python error | Make sure venv was created with `py -m venv`, not `python -m venv` |
-| Logs | `%APPDATA%\thinking-proxy\logs\` |
 
 ## Uninstall
 
