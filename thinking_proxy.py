@@ -221,23 +221,28 @@ def _fix_content_blocks(blocks: list) -> bool:
 # Endpoints
 # ---------------------------------------------------------------------------
 
-MODELS_RESPONSE = {
-    "data": [
-        {
-            "type": "model",
-            "id": "claude-opus-4-6",
-            "display_name": "Claude Opus 4.6",
-            "created_at": "2025-05-14T00:00:00Z",
-        }
-    ],
-    "has_more": False,
-    "first_id": "claude-opus-4-6",
-    "last_id": "claude-opus-4-6",
-}
+DEFAULT_MODEL_ID = "claude-opus-4-6"
+
+
+def _models_response(model_id: str) -> dict:
+    return {
+        "data": [
+            {
+                "type": "model",
+                "id": model_id,
+                "display_name": model_id,
+                "created_at": "2025-05-14T00:00:00Z",
+            }
+        ],
+        "has_more": False,
+        "first_id": model_id,
+        "last_id": model_id,
+    }
 
 
 async def handle_models(request: web.Request) -> web.Response:
-    return web.json_response(MODELS_RESPONSE)
+    model_id = os.environ.get("THINKING_PROXY_MODEL_ID", DEFAULT_MODEL_ID)
+    return web.json_response(_models_response(model_id))
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -276,6 +281,12 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     method=method, url=upstream_url,
                     headers=fwd_headers, data=body,
                 ) as upstream:
+                    if upstream.status == 413:
+                        log.warning(
+                            "<- 413 from upstream — DeepSeek's own request-size "
+                            "limit (not the proxy's); reduce the request body"
+                        )
+
                     content_type = upstream.headers.get("Content-Type", "")
 
                     if "text/event-stream" in content_type:
@@ -355,7 +366,17 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    # client_max_size: aiohttp's default is 1 MB — long Claude Code sessions
+    # (accumulated tool results, thinking, etc.) regularly exceed it, and the
+    # proxy then 413s mid-session ("Request too large (max 32MB)" in the CLI —
+    # misleading: the real cap was this local 1 MB limit). Default to 64 MB so
+    # the upstream API's own limit is the only one that applies; override with
+    # THINKING_PROXY_MAX_BODY_MB (integer MB).
+    # NOTE: must be on the Application, NOT passed to web.run_app — run_app
+    # silently drops unknown kwargs (aiohttp 3.14 logs a warning and falls
+    # back to filtered kwargs, keeping the 1 MB default).
+    max_body_mb = int(os.environ.get("THINKING_PROXY_MAX_BODY_MB", "64"))
+    app = web.Application(client_max_size=max_body_mb * 1024 * 1024)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)

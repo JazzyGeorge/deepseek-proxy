@@ -244,12 +244,26 @@ $body | curl.exe -sN -X POST http://localhost:16889/v1/messages -H "Content-Type
 The streaming test logs a `<- 200 (SSE filtered, N bytes)` line — the proxy's
 proof that a stream passed through the filter cleanly.
 
+## Running the tests
+
+```bash
+python3 -m venv thinking_proxy_venv
+thinking_proxy_venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+thinking_proxy_venv/bin/python -m pytest
+```
+
+The suite covers request normalization, the SSE filter, response fixups, the
+body-size cap, and `/v1/models`. Tests redirect the log directory to a temp
+dir — they never write to the real `proxy.log`.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | Upstream endpoint (`/v1` suffix is stripped) |
 | `THINKING_PROXY_PORT` | `16889` | Local listen port (`127.0.0.1`) |
+| `THINKING_PROXY_MAX_BODY_MB` | `64` | Max request body size in MB (aiohttp's default is 1 MB — too small for long sessions; see Troubleshooting) |
+| `THINKING_PROXY_MODEL_ID` | `claude-opus-4-6` | Model id advertised by `GET /v1/models` — change it if you configure a different model in Claude Code |
 
 | Endpoint | Behavior |
 |----------|----------|
@@ -302,6 +316,9 @@ the chunked body. Transient-error retries are skipped in that state.
 |------|---------|
 | `thinking_proxy.py` | The proxy — cross-platform Python + aiohttp |
 | `requirements.txt` | Python dependencies (`aiohttp`) |
+| `requirements-dev.txt` | Test-only dependencies (`pytest`, `pytest-asyncio`) |
+| `tests/test_proxy.py` | pytest suite — normalization, SSE filter, response fixups, body-size cap, `/v1/models` |
+| `pytest.ini` | pytest configuration |
 | `thinking_proxy_launcher.sh` | macOS launcher — sources env file, starts proxy |
 | `launcher.bat` | Windows launcher — reads env file, starts proxy |
 | `LICENSE` | MIT |
@@ -316,6 +333,8 @@ the chunked body. Transient-error retries are skipped in that state.
 | Connection refused | `curl http://localhost:16889/health` |
 | Auth errors | `ls ~/Secrets/Anthropic_DeepSeek.env` |
 | Logs | `tail ~/.local/state/thinking-proxy/proxy.log` |
+| «Request too large (max 32MB)» mid-session | The proxy's own body cap was hit — aiohttp's default is **1 MB**; the proxy raises it to 64 MB (`THINKING_PROXY_MAX_BODY_MB`). The CLI message names the *real* Anthropic API limit (32 MB); through a proxy it's misleading. Check `proxy.log`: a `->` forward line before the 413 means **upstream** (DeepSeek) rejected; no forward line means the proxy rejected it locally |
+| `proxy.log` grows forever | Never rotated — truncate occasionally (`: > ~/.local/state/thinking-proxy/proxy.log`) or add a newsyslog config |
 
 ### Windows
 

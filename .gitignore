@@ -11,3 +11,7 @@ logs/
 
 # NSSM (downloaded by setup script, not committed)
 nssm/
+
+# Python bytecode
+__pycache__/
+*.pyc
