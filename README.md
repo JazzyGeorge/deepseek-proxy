@@ -78,38 +78,37 @@ curl http://localhost:16889/health
 # → {"status": "ok", "upstream": "https://api.deepseek.com/anthropic"}
 kill %1
 
-# Install as a launchd service (auto-start at login)
-# Replace <username> with your macOS username (run `whoami` to find it)
-cat > ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.deepseek.thinking-proxy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>/Users/<username>/deepseek-proxy/thinking_proxy_launcher.sh</string>
-    </array>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>StandardOutPath</key>
-    <string>/Users/<username>/deepseek-proxy/logs/stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/<username>/deepseek-proxy/logs/stderr.log</string>
-</dict>
-</plist>
-EOF
-
-mkdir -p logs
-launchctl load -w ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist
+# Install as a launchd service (auto-start at login, restarts on crash)
+./install_macos.sh
 ```
+
+The installer resolves your username and the real repo path itself (no
+placeholders to replace), writes
+`~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist`
+(`KeepAlive` + `RunAtLoad`, logs into `<repo>/logs/`), bootstraps the
+service into your per-user GUI launchd domain, and verifies `/health`.
+
+Managing the service (per-user GUI domain, **no `sudo`** — run from a
+Terminal.app login session, not over SSH):
+
+```bash
+launchctl print gui/$(id -u)/com.deepseek.thinking-proxy    # state (look for "state = running")
+launchctl kickstart -k gui/$(id -u)/com.deepseek.thinking-proxy  # restart
+launchctl bootout gui/$(id -u)/com.deepseek.thinking-proxy  # stop/unload
+```
+
+> **KeepAlive gotcha:** `KeepAlive=true` makes launchd restart the proxy
+> whenever the Python process dies — killing the process does **not** stop
+> the service, and a manual `python3 thinking_proxy.py &` will then fight a
+> relaunched instance for port 16889. Stop a managed instance with
+> `launchctl bootout` above. Before any manual test run, check what already
+> holds the port: `lsof -nP -iTCP:16889 -sTCP:LISTEN`.
+>
+> **Modern commands:** current macOS prefers `launchctl bootstrap` /
+> `bootout` over the deprecated `launchctl load -w` / `unload`, which can
+> fail with `Load failed: 5: Input/output error` (see Troubleshooting).
+> `install_macos.sh` uses the modern commands; if you follow older guides,
+> translate them.
 
 #### Windows
 
@@ -176,14 +175,18 @@ Invoke-RestMethod -Uri "http://localhost:16889/health" -TimeoutSec 5
 
 ### 3. Configure Claude Code
 
-Add to `~/.claude/settings.json` (macOS) or set as permanent environment
-variables (Windows):
+Add an `env` block to `~/.claude/settings.json` (macOS) or set as permanent
+environment variables (Windows). If the file already contains keys (e.g.
+`"model"`), **merge** the block into the existing object — don't replace the
+whole file with this snippet:
 
 ```json
-"env": {
-  "ANTHROPIC_BASE_URL": "http://localhost:16889",
-  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-  "CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS": "1"
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:16889",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS": "1"
+  }
 }
 ```
 
@@ -198,17 +201,82 @@ For Windows, persist these via PowerShell:
 > **Important:** `ANTHROPIC_AUTH_TOKEN` stays in the secrets file — do NOT copy
 > it into `settings.json` or set it as a system-wide env var.
 
+Claude Code reads its auth token from its **process environment at startup**,
+so the key must be exported in the shell before `claude` launches. On macOS
+the reliable way is a wrapper in `~/.zshrc` that sources the secrets file.
+This is zsh-only: Claude Code launched from the desktop app, VS Code, or a
+non-login shell bypasses `.zshrc` — in those environments export the key in
+that launcher's environment instead.
+
+```bash
+claude-deepseek() {
+    source ~/Secrets/Anthropic_DeepSeek.env
+    export ANTHROPIC_BASE_URL="http://localhost:16889"
+    command claude "$@"
+}
+```
+
+Then reload and launch with the wrapper (this avoids Claude Code falling back
+to its normal Anthropic login flow):
+
+```bash
+source ~/.zshrc
+claude-deepseek
+```
+
 ### 4. Restart Claude Code
 
-Quit and restart.
+Quit and restart (or launch via the wrapper above).
 
 ## Verifying It Works
 
+Health check first (no auth needed):
+
 ```bash
-# Health check
 curl http://localhost:16889/health
 # → {"status": "ok", "upstream": "https://api.deepseek.com/anthropic"}
 ```
+
+macOS/Linux (loads the key from the secrets file first):
+
+```bash
+source ~/Secrets/Anthropic_DeepSeek.env
+AUTH="Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"
+VER="anthropic-version: 2023-06-01"
+CT="content-type: application/json"
+
+# Fix #1 — non-streaming classifier test: returns in ~2-4s, not ~30s
+curl -s -o /dev/null -w 'total: %{time_total}s\n' -X POST http://localhost:16889/v1/messages \
+  -H "$AUTH" -H "$VER" -H "$CT" \
+  -d '{"model": "claude-opus-4-6", "max_tokens": 256, "stream": false,
+       "messages": [{"role": "user", "content": "Classify this bash command as SAFE or UNSAFE with a brief reason. Command: rm -rf ~/Downloads/temp-folder/*"}]}'
+
+# Fix #3 — adaptive thinking: returns 200, not 400
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:16889/v1/messages \
+  -H "$AUTH" -H "$VER" -H "$CT" \
+  -d '{"model": "claude-opus-4-6", "max_tokens": 128, "stream": false, "thinking": {"type": "adaptive"},
+       "messages": [{"role": "user", "content": "Say hello in 3 words"}]}'
+
+# Fix #5 — tool_use: response blocks should be thinking, tool_use
+curl -s -X POST http://localhost:16889/v1/messages -H "$AUTH" -H "$VER" -H "$CT" \
+  -d '{"model": "claude-opus-4-6", "max_tokens": 256, "stream": false,
+       "tools": [{"name": "get_weather", "description": "Get the current weather",
+                  "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+       "messages": [{"role": "user", "content": "What is the weather in Paris? Use the get_weather tool."}]}' \
+  | python3 -c 'import json, sys; print([b["type"] for b in json.load(sys.stdin)["content"]])'
+# → ['thinking', 'tool_use']
+
+# Fix #2 — streaming: must complete cleanly (no 502, no broken chunked body)
+curl -sN -X POST http://localhost:16889/v1/messages -H "$AUTH" -H "$VER" -H "$CT" \
+  -d '{"model": "claude-opus-4-6", "max_tokens": 256, "stream": true,
+       "messages": [{"role": "user", "content": "Count from 1 to 5"}]}'
+# Should stream message_start → content blocks → message_stop without errors
+```
+
+Inside Claude Code, `/status` should show `Auth token: ANTHROPIC_AUTH_TOKEN`
+and `Anthropic base URL: http://localhost:16889`. (Claude Code may still
+display Anthropic-style model names in its UI — model translation happens on
+the DeepSeek compatibility layer behind the proxy, not in Claude Code.)
 
 Windows PowerShell (reads the key from the secrets file):
 
@@ -320,6 +388,8 @@ the chunked body. Transient-error retries are skipped in that state.
 | `tests/test_proxy.py` | pytest suite — normalization, SSE filter, response fixups, body-size cap, `/v1/models` |
 | `pytest.ini` | pytest configuration |
 | `thinking_proxy_launcher.sh` | macOS launcher — sources env file, starts proxy |
+| `install_macos.sh` | macOS installer — writes the LaunchAgent plist with real user/repo paths, bootstraps it (`gui/$(id -u)`), verifies `/health` |
+| `uninstall_macos.sh` | macOS uninstaller — `launchctl bootout` + removes the plist |
 | `launcher.bat` | Windows launcher — reads env file, starts proxy |
 | `LICENSE` | MIT |
 
@@ -329,10 +399,14 @@ the chunked body. Transient-error retries are skipped in that state.
 
 | Issue | Check |
 |-------|-------|
-| Proxy not running | `launchctl list \| grep thinking` |
+| Service not running | `launchctl print gui/$(id -u)/com.deepseek.thinking-proxy` — look for `state = running` |
 | Connection refused | `curl http://localhost:16889/health` |
-| Auth errors | `ls ~/Secrets/Anthropic_DeepSeek.env` |
-| Logs | `tail ~/.local/state/thinking-proxy/proxy.log` |
+| `launchctl load`/`bootstrap` fails with `5: Input/output error` | Use `launchctl bootstrap gui/$(id -u) <plist>` (the legacy `load -w` is deprecated), run from a **Terminal.app login session, not SSH**, and make sure the paths inside the plist exist — a stale/placeholder repo path is the classic cause. Re-running `./install_macos.sh` fixes all three |
+| Killing the process doesn't stop the service | `KeepAlive=true` respawns it — stop with `launchctl bootout gui/$(id -u)/com.deepseek.thinking-proxy`, don't kill PIDs |
+| Port 16889 already in use when testing manually | A launchd-managed instance may already be listening — check `lsof -nP -iTCP:16889 -sTCP:LISTEN` first |
+| Auth errors | `ls ~/Secrets/Anthropic_DeepSeek.env`; the token must be exported in the shell *before* `claude` starts (see the wrapper in "Configure Claude Code") |
+| Crash-loop in `<repo>/logs/stderr.log` | launchd respawns the proxy (KeepAlive) — read stderr.log first: it shows the real error. Fix, then `launchctl bootout` + re-run `./install_macos.sh` |
+| Proxy log | `tail ~/.local/state/thinking-proxy/proxy.log` — request/upstream diagnostics. Distinct from launchd's `<repo>/logs/stdout.log` + `stderr.log`; check both when nothing comes up |
 | «Request too large (max 32MB)» mid-session | The proxy's own body cap was hit — aiohttp's default is **1 MB**; the proxy raises it to 64 MB (`THINKING_PROXY_MAX_BODY_MB`). The CLI message names the *real* Anthropic API limit (32 MB); through a proxy it's misleading. Check `proxy.log`: a `->` forward line before the 413 means **upstream** (DeepSeek) rejected; no forward line means the proxy rejected it locally |
 | `proxy.log` grows forever | Never rotated — truncate occasionally (`: > ~/.local/state/thinking-proxy/proxy.log`) or add a newsyslog config |
 
@@ -351,9 +425,11 @@ the chunked body. Transient-error retries are skipped in that state.
 ### macOS
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist
-rm ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist
+./uninstall_macos.sh
 ```
+
+(Manual alternative: `launchctl bootout gui/$(id -u)/com.deepseek.thinking-proxy`
+then `rm ~/Library/LaunchAgents/com.deepseek.thinking-proxy.plist`.)
 
 ### Windows
 
