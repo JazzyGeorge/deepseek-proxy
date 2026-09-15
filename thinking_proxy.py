@@ -22,10 +22,11 @@ from pathlib import Path
 if not sys.stdin.isatty():
     os.environ.setdefault("PYTHON_BASIC_REPL", "1")
 
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession, TCPConnector, web
 from aiohttp.client_exceptions import (
     ClientConnectorError,
     ClientPayloadError,
+    ServerDisconnectedError,
 )
 
 LISTEN_HOST = "127.0.0.1"
@@ -34,14 +35,16 @@ UPSTREAM_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/an
 if UPSTREAM_URL.endswith("/v1"):
     UPSTREAM_URL = UPSTREAM_URL[:-3]
 
-RETRY_DELAY = 1.5
-MAX_RETRIES = 1
+RETRY_BASE_DELAY = float(os.environ.get("THINKING_PROXY_RETRY_BASE_DELAY", "0.5"))
+MAX_RETRIES = int(os.environ.get("THINKING_PROXY_MAX_RETRIES", "3"))
 TRANSIENT_ERRORS = (
     ClientConnectorError,
     ClientPayloadError,
+    ServerDisconnectedError,
     ConnectionResetError,
     TimeoutError,
 )
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 
 HOP_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection",
@@ -250,6 +253,32 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Upstream session
+# ---------------------------------------------------------------------------
+
+def create_upstream_session() -> ClientSession:
+    connector = TCPConnector(
+        limit=int(os.environ.get("THINKING_PROXY_MAX_CONNECTIONS", "100")),
+        keepalive_timeout=float(
+            os.environ.get("THINKING_PROXY_KEEPALIVE_SECONDS", "300")
+        ),
+        ttl_dns_cache=300,
+    )
+    return ClientSession(connector=connector)
+
+
+UPSTREAM_SESSION_KEY = web.AppKey("upstream_session", ClientSession)
+
+
+async def upstream_session_ctx(app: web.Application):
+    app[UPSTREAM_SESSION_KEY] = create_upstream_session()
+    try:
+        yield
+    finally:
+        await app[UPSTREAM_SESSION_KEY].close()
+
+
+# ---------------------------------------------------------------------------
 # Main proxy handler
 # ---------------------------------------------------------------------------
 
@@ -274,64 +303,74 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
     last_exc = None
     stream_started = False
+    session = request.app[UPSTREAM_SESSION_KEY]
     for attempt in range(MAX_RETRIES + 1):
         try:
-            async with ClientSession() as session:
-                async with session.request(
-                    method=method, url=upstream_url,
-                    headers=fwd_headers, data=body,
-                ) as upstream:
-                    if upstream.status == 413:
-                        log.warning(
-                            "<- 413 from upstream — DeepSeek's own request-size "
-                            "limit (not the proxy's); reduce the request body"
-                        )
+            async with session.request(
+                method=method, url=upstream_url,
+                headers=fwd_headers, data=body,
+            ) as upstream:
+                if upstream.status in TRANSIENT_STATUSES and attempt < MAX_RETRIES:
+                    await upstream.read()
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning(
+                        "upstream returned %d (attempt %d/%d) — retrying in %.1fs",
+                        upstream.status, attempt + 1, MAX_RETRIES + 1, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-                    content_type = upstream.headers.get("Content-Type", "")
+                if upstream.status == 413:
+                    log.warning(
+                        "<- 413 from upstream — DeepSeek's own request-size "
+                        "limit (not the proxy's); reduce the request body"
+                    )
 
-                    if "text/event-stream" in content_type:
-                        resp = web.StreamResponse(
-                            status=upstream.status,
-                            headers={k: v for k, v in upstream.headers.items()
-                                     if k.lower() not in HOP_HEADERS},
-                        )
-                        resp.headers["Cache-Control"] = "no-cache"
-                        resp.headers["X-Accel-Buffering"] = "no"
-                        await resp.prepare(request)
-                        stream_started = True
+                content_type = upstream.headers.get("Content-Type", "")
 
-                        sse_filter = SseFilter()
-                        byte_count = 0
-                        async for chunk in upstream.content.iter_any():
-                            if chunk:
-                                filtered = sse_filter.feed(chunk)
-                                if filtered:
-                                    await resp.write(filtered)
-                                    byte_count += len(filtered)
+                if "text/event-stream" in content_type:
+                    resp = web.StreamResponse(
+                        status=upstream.status,
+                        headers={k: v for k, v in upstream.headers.items()
+                                 if k.lower() not in HOP_HEADERS},
+                    )
+                    resp.headers["Cache-Control"] = "no-cache"
+                    resp.headers["X-Accel-Buffering"] = "no"
+                    await resp.prepare(request)
+                    stream_started = True
 
-                        remaining = sse_filter.flush()
-                        if remaining:
-                            await resp.write(remaining)
-                            byte_count += len(remaining)
+                    sse_filter = SseFilter()
+                    byte_count = 0
+                    async for chunk in upstream.content.iter_any():
+                        if chunk:
+                            filtered = sse_filter.feed(chunk)
+                            if filtered:
+                                await resp.write(filtered)
+                                byte_count += len(filtered)
 
-                        await resp.write_eof()
-                        log.info("<- %d (SSE filtered, %d bytes)", upstream.status, byte_count)
-                        return resp
-                    else:
-                        resp_body = await upstream.read()
+                    remaining = sse_filter.flush()
+                    if remaining:
+                        await resp.write(remaining)
+                        byte_count += len(remaining)
 
-                        if upstream.status == 200 and b"tool_use" in resp_body:
-                            fixed_body = inject_missing_thinking_blocks(resp_body)
-                            if fixed_body != resp_body:
-                                resp_body = fixed_body
+                    await resp.write_eof()
+                    log.info("<- %d (SSE filtered, %d bytes)", upstream.status, byte_count)
+                    return resp
+                else:
+                    resp_body = await upstream.read()
 
-                        log.info("<- %d (%d bytes)", upstream.status, len(resp_body))
-                        return web.Response(
-                            status=upstream.status,
-                            headers={k: v for k, v in upstream.headers.items()
-                                     if k.lower() not in HOP_HEADERS},
-                            body=resp_body,
-                        )
+                    if upstream.status == 200 and b"tool_use" in resp_body:
+                        fixed_body = inject_missing_thinking_blocks(resp_body)
+                        if fixed_body != resp_body:
+                            resp_body = fixed_body
+
+                    log.info("<- %d (%d bytes)", upstream.status, len(resp_body))
+                    return web.Response(
+                        status=upstream.status,
+                        headers={k: v for k, v in upstream.headers.items()
+                                 if k.lower() not in HOP_HEADERS},
+                        body=resp_body,
+                    )
         except TRANSIENT_ERRORS as exc:
             last_exc = exc
             if stream_started:
@@ -339,11 +378,12 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 # and retrying would only fetch data for a dead connection.
                 break
             if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
                 log.warning(
                     "upstream transient error (attempt %d/%d): %s: %s — retrying in %.1fs",
-                    attempt + 1, MAX_RETRIES + 1, type(exc).__name__, exc, RETRY_DELAY,
+                    attempt + 1, MAX_RETRIES + 1, type(exc).__name__, exc, delay,
                 )
-                await asyncio.sleep(RETRY_DELAY)
+                await asyncio.sleep(delay)
         except Exception as exc:
             last_exc = exc
             log.exception("non-transient upstream error on %s %s", method, path)
@@ -377,6 +417,7 @@ def create_app() -> web.Application:
     # back to filtered kwargs, keeping the 1 MB default).
     max_body_mb = int(os.environ.get("THINKING_PROXY_MAX_BODY_MB", "64"))
     app = web.Application(client_max_size=max_body_mb * 1024 * 1024)
+    app.cleanup_ctx.append(upstream_session_ctx)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)

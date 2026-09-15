@@ -29,14 +29,30 @@ def _large_body(size: int = 1_300_000) -> bytes:
 
 
 @asynccontextmanager
-async def upstream_server(status: int = 200):
+async def upstream_server(
+    status: int = 200,
+    peers: list | None = None,
+    fail_first: int = 0,
+    statuses: list[int] | None = None,
+):
     """Fake upstream with a generous body cap so the proxy's own cap is the
     binding one (aiohttp's default 1 MB would 413 the forwarded body)."""
     app = web.Application(client_max_size=128 * 1024 * 1024)
+    state = {"failed": 0, "served": 0}
 
     async def handler(request):
         await request.read()
-        return web.Response(status=status, body=b'{"ok": true}')
+        if state["failed"] < fail_first:
+            state["failed"] += 1
+            request.transport.abort()
+            return
+        if peers is not None:
+            peers.append(request.transport.get_extra_info("peername"))
+        response_status = status
+        if statuses:
+            response_status = statuses[min(state["served"], len(statuses) - 1)]
+            state["served"] += 1
+        return web.Response(status=response_status, body=b'{"ok": true}')
 
     app.router.add_post("/v1/messages", handler)
     server = TestServer(app)
@@ -261,3 +277,50 @@ def test_mask_key_long():
 
 def test_mask_key_empty():
     assert tp.mask_key("") == "<empty>"
+
+
+# ---------------------------------------------------------------------------
+# Upstream transport resilience
+# ---------------------------------------------------------------------------
+
+def _small_body() -> bytes:
+    return json.dumps(
+        {"model": "x", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_upstream_connection_is_reused_across_requests(monkeypatch):
+    """Break caught: creating a fresh upstream TCP connection per request."""
+    peers = []
+    async with upstream_server(peers=peers) as url:
+        monkeypatch.setattr(tp, "UPSTREAM_URL", url)
+        async with proxy_client() as client:
+            for _ in range(3):
+                resp = await client.post("/v1/messages", data=_small_body())
+                assert resp.status == 200
+
+    assert len(peers) == 3
+    assert len(set(peers)) == 1
+
+
+@pytest.mark.asyncio
+async def test_dropped_upstream_connection_is_retried(monkeypatch):
+    """Break caught: surfacing a transient disconnect as a client-visible 502."""
+    monkeypatch.setattr(tp, "RETRY_BASE_DELAY", 0.01, raising=False)
+    async with upstream_server(fail_first=2) as url:
+        monkeypatch.setattr(tp, "UPSTREAM_URL", url)
+        async with proxy_client() as client:
+            resp = await client.post("/v1/messages", data=_small_body())
+            assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_transient_upstream_503_is_retried(monkeypatch):
+    """Break caught: forwarding a recoverable DeepSeek 503 directly to Claude."""
+    monkeypatch.setattr(tp, "RETRY_BASE_DELAY", 0.01, raising=False)
+    async with upstream_server(statuses=[503, 200]) as url:
+        monkeypatch.setattr(tp, "UPSTREAM_URL", url)
+        async with proxy_client() as client:
+            resp = await client.post("/v1/messages", data=_small_body())
+            assert resp.status == 200
